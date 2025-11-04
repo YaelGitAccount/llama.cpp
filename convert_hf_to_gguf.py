@@ -3622,10 +3622,6 @@ class Qwen2VLVisionModel(MmprojModel):
             # Add spatial_merge_size for patch merge (stored as n_merge in hparams)
             self.gguf_writer.add_vision_spatial_merge_size(2)
             
-            # Add additional metadata for debugging/validation
-            self.gguf_writer.add_key_value("clip.vision.patch_merge_factor", 2, gguf.GGUFValueType.INT32)
-            self.gguf_writer.add_key_value("clip.vision.patch_merge_mode", "concat2x2", gguf.GGUFValueType.STRING)
-            
             # Add grid dimensions for runtime to calculate merge
             image_size = self.find_vparam(["image_size"])
             patch_size = self.find_vparam(["patch_size"])

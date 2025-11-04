@@ -23,6 +23,7 @@
 #include <limits>
 #include <array>
 #include <functional>
+#include <cstdio>
 
 // TODO: allow to pass callback from user code
 struct clip_logger_state g_logger_state = {GGML_LOG_LEVEL_CONT, clip_log_callback_default, NULL};
@@ -673,10 +674,23 @@ struct clip_graph {
 
         // LlavaMultiModalProjector (always using GELU activation)
         {
-            // Eagle2-VL: Apply patch merge before MLP projection if n_merge > 0
-            if (hparams.n_merge > 0 && (model.proj_type == PROJECTOR_TYPE_MLP || model.proj_type == PROJECTOR_TYPE_MLP_NORM)) {
+            // Eagle2-VL: Apply patch merge before MLP projection if n_merge > 1
+            // Prefer clip.vision.spatial_merge_size; treat n_merge==1 as no-merge
+            if (hparams.n_merge > 1 && (model.proj_type == PROJECTOR_TYPE_MLP || model.proj_type == PROJECTOR_TYPE_MLP_NORM)) {
                 const int scale_factor = hparams.n_merge;
+                // minimal debug: pre-merge C/T
+                {
+                    int C = (int) cur->ne[0];
+                    int T = (int) cur->ne[1];
+                    printf("[E2VL] pre-merge: C=%d, T=%d\n", C, T);
+                }
                 cur = build_patch_merge_permute(cur, scale_factor);
+                // minimal debug: post-merge C/T
+                {
+                    int C_new = (int) cur->ne[0];
+                    int T_new = (int) cur->ne[1];
+                    printf("[E2VL] post-merge: C=%d, T=%d\n", C_new, T_new);
+                }
             }
 
             // Use mm_0_w/mm_0_b if available (Eagle2-VL), otherwise mm_1_w/mm_1_b (standard LLaVA)
@@ -693,6 +707,14 @@ struct clip_graph {
             
             // Ensure 2D and correct orientation for matmul: first_w[out,in] x cur[in, tokens]
             cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], cur->ne[1]);
+            // minimal debug: shapes before first matmul in this block
+            if (first_w) {
+                int emb_C = (int) cur->ne[0];
+                int emb_T = (int) cur->ne[1];
+                int w0_in  = (int) first_w->ne[0];
+                int w0_out = (int) first_w->ne[1];
+                printf("[E2VL] emb=[%d,%d], w0=[%d,%d]\n", emb_C, emb_T, w0_in, w0_out);
+            }
             if (first_w && first_w->ne[1] != cur->ne[0]) {
                 LOG_WRN("%s: eagle2-mlp: dim mismatch, transposing cur: first_w[in]=%lld, cur[0]=%lld, cur[1]=%lld\n",
                         __func__, (long long) first_w->ne[1], (long long) cur->ne[0], (long long) cur->ne[1]);
@@ -718,8 +740,8 @@ struct clip_graph {
             // and then concatenate the [IMG_BREAK] token to the end of each row, aka n_patches_per_row dimension
             // after the concatenation, we have a tensor with shape [n_embd, n_patches_per_row + 1, n_rows]
 
-            const int p_y             = n_merge > 0 ? n_patches_y / n_merge : n_patches_y;
-            const int p_x             = n_merge > 0 ? n_patches_x / n_merge : n_patches_x;
+            const int p_y             = n_merge > 1 ? n_patches_y / n_merge : n_patches_y;
+            const int p_x             = n_merge > 1 ? n_patches_x / n_merge : n_patches_x;
             const int p_total         = p_x * p_y;
             const int n_embd_text     = cur->ne[0];
             const int n_tokens_output = p_total + p_y - 1; // one [IMG_BREAK] per row, except the last row
@@ -905,24 +927,26 @@ struct clip_graph {
             inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, norm_t, eps, n_layer);
         }
 
-        // Eagle2-VL specific 2x2 patch merge (conditional)
-        // Apply 2x2 patch merge if specified in metadata
-        if (hparams.patch_merge_factor == 2 && hparams.patch_merge_mode == "concat2x2") {
-            // Use the existing patch merge function with scale factor 2
-            // This converts patches from [n_embd, n_patches] to [n_embd*4, n_patches/4]
-            // For Eagle2-VL: [1152, 1024] -> [4608, 256]
+        // Apply patch merge based on metadata
+        // Preferred: clip.vision.spatial_merge_size -> hparams.n_merge
+        // Fallback: legacy keys clip.vision.patch_merge_factor/mode
+        bool did_spatial_merge = false;
+        if (hparams.n_merge > 1) {
+            // e.g. [1152, 1024] -> [1152 * n_merge^2, 1024 / n_merge^2]
+            inpL = build_patch_merge_permute(inpL, hparams.n_merge);
+            did_spatial_merge = true;
+        } else if (hparams.patch_merge_factor > 1 && (hparams.patch_merge_mode == "concat2x2" || hparams.patch_merge_mode == "concat")) {
+            // legacy fallback (kept for backward compatibility)
             inpL = build_patch_merge_permute(inpL, hparams.patch_merge_factor);
+            did_spatial_merge = true;
         }
 
         // multimodal projection
         ggml_tensor * embeddings = inpL;
         
         // Conditional reshape based on whether patch merge was applied
-        if (hparams.patch_merge_factor == 2 && hparams.patch_merge_mode == "concat2x2") {
-            // Already in the right shape: [n_embd * 4, n_pos / 4, batch_size]
-            // No additional reshape needed
-        } else {
-            // Standard Qwen2VL path with hardcoded 2x2 merge
+        if (!did_spatial_merge) {
+            // Standard Qwen2VL path assumes 2x2 merge semantics without explicit permute
             embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);
         }
 
@@ -1026,7 +1050,7 @@ struct clip_graph {
 
         // deepstack features (stack along the feature dimension), [n_embd * len(deepstack_layers), n_patches_x * n_patches_y, batch_size]
         ggml_tensor * deepstack_features = nullptr;
-        const int merge_factor = hparams.n_merge > 0 ? hparams.n_merge * hparams.n_merge : 4; // default 2x2=4 for qwen3vl
+    const int merge_factor = hparams.n_merge > 1 ? hparams.n_merge * hparams.n_merge : 4; // default 2x2=4 for qwen3vl
 
         // loop over layers
         for (int il = 0; il < n_layer; il++) {
@@ -1606,18 +1630,38 @@ struct clip_graph {
 
             // llava projector
             if (ctx->proj_type() == PROJECTOR_TYPE_MLP) {
-                // Eagle2-VL: apply 2x2 patch merge on [C, T] layout directly
-                if (hparams.n_merge > 0) {
+                // Eagle2-VL: apply 2x2 patch merge on [C, T] layout directly when n_merge > 1
+                if (hparams.n_merge > 1) {
                     // ensure contiguous before reshape/permutation in patch merge
                     embeddings = ggml_cont(ctx0, embeddings);
                     const int scale_factor = hparams.n_merge;
+                    // minimal debug: pre-merge C/T (embeddings)
+                    {
+                        int C = (int) embeddings->ne[0];
+                        int T = (int) embeddings->ne[1];
+                        printf("[E2VL] pre-merge: C=%d, T=%d\n", C, T);
+                    }
                     embeddings = build_patch_merge_permute(embeddings, scale_factor);
+                    // minimal debug: post-merge C/T (embeddings)
+                    {
+                        int C_new = (int) embeddings->ne[0];
+                        int T_new = (int) embeddings->ne[1];
+                        printf("[E2VL] post-merge: C=%d, T=%d\n", C_new, T_new);
+                    }
                 }
         LOG_INF("%s: llava-mlp before mm_0: emb[%lld, %lld], w0[%lld, %lld]\n", __func__,
             (long long) embeddings->ne[0], (long long) embeddings->ne[1],
             (long long) model.mm_0_w->ne[0], (long long) model.mm_0_w->ne[1]);
                 ggml_tensor * w0 = model.mm_0_w;
                 // ggml expects w->ne[0] (in_dim) == emb->ne[0]. If loader stored [out,in], fix with transpose.
+                // minimal debug: shapes right before mm_0 matmul
+                {
+                    int emb_C = (int) embeddings->ne[0];
+                    int emb_T = (int) embeddings->ne[1];
+                    int w0_in  = (int) w0->ne[0];
+                    int w0_out = (int) w0->ne[1];
+                    printf("[E2VL] emb=[%d,%d], w0=[%d,%d]\n", emb_C, emb_T, w0_in, w0_out);
+                }
                 if (w0->ne[0] != embeddings->ne[0] && w0->ne[1] == embeddings->ne[0]) {
                     LOG_WRN("%s: llava-mlp: transposing mm_0_w for mul_mat: w0[%lld, %lld] emb[%lld, %lld]", __func__,
                            (long long) w0->ne[0], (long long) w0->ne[1],
@@ -2826,6 +2870,8 @@ struct clip_model_loader {
                     {
                         // Eagle2-VL: Load spatial merge size for patch merge
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        // minimal debug: report n_merge loaded from metadata
+                        printf("[E2VL] n_merge=%d\n", hparams.n_merge);
                     } break;
                 case PROJECTOR_TYPE_MINICPMV:
                     {
@@ -4626,8 +4672,8 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
             {
                 // dynamic size
                 int n_merge = ctx->model.hparams.n_merge;
-                int n_patches_x = img->nx / patch_size / (n_merge > 0 ? n_merge : 1);
-                int n_patches_y = img->ny / patch_size / (n_merge > 0 ? n_merge : 1);
+                int n_patches_x = img->nx / patch_size / (n_merge > 1 ? n_merge : 1);
+                int n_patches_y = img->ny / patch_size / (n_merge > 1 ? n_merge : 1);
                 if (ctx->model.token_embd_img_break) {
                     n_patches = n_patches_y * n_patches_x + n_patches_y - 1; // + one [IMG_BREAK] per row, except the last row
                 } else {
