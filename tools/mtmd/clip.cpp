@@ -184,6 +184,12 @@ struct clip_hparams {
     ffn_op_type ffn_op = FFN_GELU;
 
     patch_merge_type mm_patch_merge_type = PATCH_MERGE_FLAT;
+    
+    // Eagle2-VL specific patch merge parameters
+    int32_t patch_merge_factor = 1;  // Default: no merging (1x1)
+    std::string patch_merge_mode = "flat";  // Default: flat (no special merging)
+    int32_t grid_h = 0;  // Grid height for patch merging
+    int32_t grid_w = 0;  // Grid width for patch merging
 
     float eps = 1e-6;
     float rope_theta = 0.0;
@@ -667,9 +673,35 @@ struct clip_graph {
 
         // LlavaMultiModalProjector (always using GELU activation)
         {
-            cur = ggml_mul_mat(ctx0, model.mm_1_w, cur);
-            if (model.mm_1_b) {
-                cur = ggml_add(ctx0, cur, model.mm_1_b);
+            // Eagle2-VL: Apply patch merge before MLP projection if n_merge > 0
+            if (hparams.n_merge > 0 && (model.proj_type == PROJECTOR_TYPE_MLP || model.proj_type == PROJECTOR_TYPE_MLP_NORM)) {
+                const int scale_factor = hparams.n_merge;
+                cur = build_patch_merge_permute(cur, scale_factor);
+            }
+
+            // Use mm_0_w/mm_0_b if available (Eagle2-VL), otherwise mm_1_w/mm_1_b (standard LLaVA)
+            ggml_tensor * first_w = model.mm_0_w ? model.mm_0_w : model.mm_1_w;
+            ggml_tensor * first_b = model.mm_0_b ? model.mm_0_b : model.mm_1_b;
+
+            // Debug shapes before projection to catch matmul mismatches
+            LOG_INF("%s: eagle2-mlp: cur shape:    [%lld, %lld, %lld]\n", __func__,
+                    (long long) cur->ne[0], (long long) cur->ne[1], (long long) cur->ne[2]);
+            if (first_w) {
+                LOG_INF("%s: eagle2-mlp: first_w:     [%lld, %lld]\n", __func__,
+                        (long long) first_w->ne[0], (long long) first_w->ne[1]);
+            }
+            
+            // Ensure 2D and correct orientation for matmul: first_w[out,in] x cur[in, tokens]
+            cur = ggml_reshape_2d(ctx0, cur, cur->ne[0], cur->ne[1]);
+            if (first_w && first_w->ne[1] != cur->ne[0]) {
+                LOG_WRN("%s: eagle2-mlp: dim mismatch, transposing cur: first_w[in]=%lld, cur[0]=%lld, cur[1]=%lld\n",
+                        __func__, (long long) first_w->ne[1], (long long) cur->ne[0], (long long) cur->ne[1]);
+                cur = ggml_transpose(ctx0, cur);
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_mul_mat(ctx0, first_w, cur);
+            if (first_b) {
+                cur = ggml_add(ctx0, cur, first_b);
             }
 
             cur = ggml_gelu(ctx0, cur);
@@ -710,7 +742,7 @@ struct clip_graph {
 
     // Qwen2VL and Qwen2.5VL use M-RoPE
     ggml_cgraph * build_qwen2vl() {
-        GGML_ASSERT(model.patch_bias == nullptr);
+        // Eagle2-VL and some variants may have patch bias
         GGML_ASSERT(model.class_embedding == nullptr);
 
         const int batch_size       = 1;
@@ -747,6 +779,12 @@ struct clip_graph {
             inp = ggml_cont_3d(
                 ctx0, inp,
                 n_embd, n_patches_x * n_patches_y, batch_size);
+        }
+
+        // add patch bias if present (Eagle2-VL has patch bias)
+        if (model.patch_bias != nullptr) {
+            inp = ggml_add(ctx0, inp, model.patch_bias);
+            cb(inp, "patch_bias", -1);
         }
 
         ggml_tensor * inpL           = inp;
@@ -867,9 +905,26 @@ struct clip_graph {
             inpL = build_norm(inpL, model.post_ln_w, model.post_ln_b, norm_t, eps, n_layer);
         }
 
+        // Eagle2-VL specific 2x2 patch merge (conditional)
+        // Apply 2x2 patch merge if specified in metadata
+        if (hparams.patch_merge_factor == 2 && hparams.patch_merge_mode == "concat2x2") {
+            // Use the existing patch merge function with scale factor 2
+            // This converts patches from [n_embd, n_patches] to [n_embd*4, n_patches/4]
+            // For Eagle2-VL: [1152, 1024] -> [4608, 256]
+            inpL = build_patch_merge_permute(inpL, hparams.patch_merge_factor);
+        }
+
         // multimodal projection
         ggml_tensor * embeddings = inpL;
-        embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);
+        
+        // Conditional reshape based on whether patch merge was applied
+        if (hparams.patch_merge_factor == 2 && hparams.patch_merge_mode == "concat2x2") {
+            // Already in the right shape: [n_embd * 4, n_pos / 4, batch_size]
+            // No additional reshape needed
+        } else {
+            // Standard Qwen2VL path with hardcoded 2x2 merge
+            embeddings = ggml_reshape_3d(ctx0, embeddings, n_embd * 4, n_pos / 4, batch_size);
+        }
 
         embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
         embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
@@ -1551,12 +1606,37 @@ struct clip_graph {
 
             // llava projector
             if (ctx->proj_type() == PROJECTOR_TYPE_MLP) {
-                embeddings = ggml_mul_mat(ctx0, model.mm_0_w, embeddings);
+                // Eagle2-VL: apply 2x2 patch merge on [C, T] layout directly
+                if (hparams.n_merge > 0) {
+                    // ensure contiguous before reshape/permutation in patch merge
+                    embeddings = ggml_cont(ctx0, embeddings);
+                    const int scale_factor = hparams.n_merge;
+                    embeddings = build_patch_merge_permute(embeddings, scale_factor);
+                }
+        LOG_INF("%s: llava-mlp before mm_0: emb[%lld, %lld], w0[%lld, %lld]\n", __func__,
+            (long long) embeddings->ne[0], (long long) embeddings->ne[1],
+            (long long) model.mm_0_w->ne[0], (long long) model.mm_0_w->ne[1]);
+                ggml_tensor * w0 = model.mm_0_w;
+                // ggml expects w->ne[0] (in_dim) == emb->ne[0]. If loader stored [out,in], fix with transpose.
+                if (w0->ne[0] != embeddings->ne[0] && w0->ne[1] == embeddings->ne[0]) {
+                    LOG_WRN("%s: llava-mlp: transposing mm_0_w for mul_mat: w0[%lld, %lld] emb[%lld, %lld]", __func__,
+                           (long long) w0->ne[0], (long long) w0->ne[1],
+                           (long long) embeddings->ne[0], (long long) embeddings->ne[1]);
+                    w0 = ggml_cont(ctx0, ggml_transpose(ctx0, w0));
+                }
+                embeddings = ggml_mul_mat(ctx0, w0, embeddings);
                 embeddings = ggml_add(ctx0, embeddings, model.mm_0_b);
 
                 embeddings = ggml_gelu(ctx0, embeddings);
                 if (model.mm_2_w) {
-                    embeddings = ggml_mul_mat(ctx0, model.mm_2_w, embeddings);
+                    ggml_tensor * w2 = model.mm_2_w;
+                    if (w2->ne[0] != embeddings->ne[0] && w2->ne[1] == embeddings->ne[0]) {
+                        LOG_WRN("%s: llava-mlp: transposing mm_2_w for mul_mat: w2[%lld, %lld] emb[%lld, %lld]", __func__,
+                               (long long) w2->ne[0], (long long) w2->ne[1],
+                               (long long) embeddings->ne[0], (long long) embeddings->ne[1]);
+                        w2 = ggml_cont(ctx0, ggml_transpose(ctx0, w2));
+                    }
+                    embeddings = ggml_mul_mat(ctx0, w2, embeddings);
                     embeddings = ggml_add(ctx0, embeddings, model.mm_2_b);
                 }
             }
@@ -2706,6 +2786,12 @@ struct clip_model_loader {
                 if (mm_patch_merge_type == "spatial_unpad") {
                     hparams.mm_patch_merge_type = PATCH_MERGE_SPATIAL_UNPAD;
                 }
+                
+                // Load Eagle2-VL specific patch merge metadata
+                get_i32("clip.vision.patch_merge_factor", hparams.patch_merge_factor, false);
+                get_string("clip.vision.patch_merge_mode", hparams.patch_merge_mode, false);
+                get_i32("clip.vision.grid_h", hparams.grid_h, false);
+                get_i32("clip.vision.grid_w", hparams.grid_w, false);
             }
 
             if (is_vision) {
@@ -2735,6 +2821,12 @@ struct clip_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
+                case PROJECTOR_TYPE_MLP:
+                case PROJECTOR_TYPE_MLP_NORM:
+                    {
+                        // Eagle2-VL: Load spatial merge size for patch merge
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                    } break;
                 case PROJECTOR_TYPE_MINICPMV:
                     {
                         if (hparams.minicpmv_version == 0) {
@@ -4462,7 +4554,12 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
             {
-                // do nothing
+                // account for spatial patch merge when present (e.g., Eagle2-VL)
+                // both X and Y are downscaled by the merge factor
+                const int scale_factor = ctx->model.hparams.n_merge;
+                if (scale_factor > 0) {
+                    n_patches /= (scale_factor * scale_factor);
+                }
             } break;
         case PROJECTOR_TYPE_LDP:
         case PROJECTOR_TYPE_LDPV2:
